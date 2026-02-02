@@ -5,6 +5,10 @@
  * Create specialized agent modes that switch to the right model, set thinking level,
  * and inject the right skill, then auto-restore when done.
  *
+ * Also supports model/thinking switching for Skills via the Agent Skills spec-compliant
+ * `metadata` field. Skills can specify model preferences that trigger automatic switching
+ * when invoked via /skill:name commands.
+ *
  * ┌─────────────────────────────────────────────────────────────────────────────┐
  * │                                                                             │
  * │  You're using Opus                                                          │
@@ -36,6 +40,20 @@
  * Skill locations (checked in order):
  * - <cwd>/.pi/skills/{name}/SKILL.md (project)
  * - ~/.pi/agent/skills/{name}/SKILL.md (user)
+ *
+ * Example skill with model metadata (Agent Skills spec-compliant):
+ * ```markdown
+ * ---
+ * name: deep-analysis
+ * description: Complex analysis requiring reasoning
+ * metadata:
+ *   model:
+ *     provider: anthropic
+ *     id: claude-sonnet-4-20250514
+ *   thinkingLevel: high
+ * ---
+ * Analyze the problem thoroughly...
+ * ```
  *
  * Example prompt file (e.g., ~/.pi/agent/prompts/debug-python.md):
  * ```markdown
@@ -69,10 +87,23 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Model } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext, MessageRenderOptions, Theme } from "@mariozechner/pi-coding-agent";
+import { loadSkills, type Skill } from "@mariozechner/pi-coding-agent";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { Box, Text, Spacer, Container } from "@mariozechner/pi-tui";
 
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+
+// ============================================================================
+// Skill Metadata Types (Agent Skills spec-compliant)
+// ============================================================================
+
+interface SkillModelMetadata {
+	model?: {
+		provider: string;
+		id: string;
+	};
+	thinkingLevel?: ThinkingLevel;
+}
 
 interface PromptWithModel {
 	name: string;
@@ -117,6 +148,96 @@ function parseFrontmatter(content: string): { frontmatter: Record<string, string
 	}
 
 	return { frontmatter, content: body };
+}
+
+/**
+ * Parse nested metadata from skill frontmatter (Agent Skills spec-compliant).
+ * Handles YAML like:
+ *   metadata:
+ *     model:
+ *       provider: anthropic
+ *       id: claude-sonnet-4
+ *     thinkingLevel: high
+ */
+function parseSkillMetadata(content: string): SkillModelMetadata {
+	const normalized = content.replace(/\r\n/g, "\n");
+
+	if (!normalized.startsWith("---")) {
+		return {};
+	}
+
+	const endIndex = normalized.indexOf("\n---", 3);
+	if (endIndex === -1) {
+		return {};
+	}
+
+	const frontmatterBlock = normalized.slice(4, endIndex);
+	const lines = frontmatterBlock.split("\n");
+
+	let inMetadata = false;
+	let inModel = false;
+	const metadata: SkillModelMetadata = {};
+	const model: { provider?: string; id?: string } = {};
+
+	for (const line of lines) {
+		const trimmed = line.trimEnd();
+
+		// Check for metadata: section
+		if (trimmed === "metadata:") {
+			inMetadata = true;
+			continue;
+		}
+
+		// If we hit a non-indented line, we're out of metadata
+		if (inMetadata && trimmed.length > 0 && !trimmed.startsWith(" ") && !trimmed.startsWith("\t")) {
+			inMetadata = false;
+			inModel = false;
+		}
+
+		if (!inMetadata) continue;
+
+		// Check for model: subsection (2-space indent)
+		if (trimmed.match(/^\s{2}model:\s*$/)) {
+			inModel = true;
+			continue;
+		}
+
+		// Check for thinkingLevel at metadata level (2-space indent)
+		const thinkingMatch = trimmed.match(/^\s{2}thinkingLevel:\s*(.+)$/);
+		if (thinkingMatch) {
+			const level = thinkingMatch[1].trim().replace(/['"]/g, "");
+			if ((VALID_THINKING_LEVELS as readonly string[]).includes(level)) {
+				metadata.thinkingLevel = level as ThinkingLevel;
+			}
+			continue;
+		}
+
+		// If we hit another 2-space key, we're out of model
+		if (inModel && trimmed.match(/^\s{2}[a-z]/i) && !trimmed.match(/^\s{4}/)) {
+			inModel = false;
+		}
+
+		if (!inModel) continue;
+
+		// Parse model properties (4-space indent)
+		const providerMatch = trimmed.match(/^\s{4}provider:\s*(.+)$/);
+		if (providerMatch) {
+			model.provider = providerMatch[1].trim().replace(/['"]/g, "");
+			continue;
+		}
+
+		const idMatch = trimmed.match(/^\s{4}id:\s*(.+)$/);
+		if (idMatch) {
+			model.id = idMatch[1].trim().replace(/['"]/g, "");
+			continue;
+		}
+	}
+
+	if (model.provider && model.id) {
+		metadata.model = { provider: model.provider, id: model.id };
+	}
+
+	return metadata;
 }
 
 /**
@@ -376,6 +497,10 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 	let previousModel: Model<any> | undefined;
 	let previousThinking: ThinkingLevel | undefined;
 	let pendingSkill: { name: string; cwd: string } | undefined;
+
+	// Skill model routing state
+	let cachedSkills: Skill[] = [];
+	let skillInProgress = false;
 	
 	// Register custom message renderer for skill-loaded messages
 	pi.registerMessageRenderer<SkillLoadedDetails>("skill-loaded", renderSkillLoaded);
@@ -447,9 +572,97 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	// Reload prompts on session start (in case cwd changed)
+	// Reload prompts and skills on session start (in case cwd changed)
 	pi.on("session_start", async (_event, ctx) => {
 		prompts = loadPromptsWithModel(ctx.cwd);
+		const result = loadSkills({ cwd: ctx.cwd });
+		cachedSkills = result.skills;
+	});
+
+	// Intercept /skill:name commands to check for model metadata
+	pi.on("input", async (event, ctx) => {
+		const text = event.text.trim();
+
+		// Only handle /skill: commands
+		if (!text.startsWith("/skill:")) {
+			return { action: "continue" };
+		}
+
+		// Extract skill name
+		const spaceIndex = text.indexOf(" ");
+		const skillName = spaceIndex === -1 ? text.slice(7) : text.slice(7, spaceIndex);
+
+		// Find the skill
+		let skill = cachedSkills.find((s) => s.name === skillName);
+
+		if (!skill) {
+			// Skill not in cache - try reloading in case it was added
+			const result = loadSkills({ cwd: ctx.cwd });
+			cachedSkills = result.skills;
+			skill = cachedSkills.find((s) => s.name === skillName);
+			if (!skill) {
+				return { action: "continue" }; // Let pi handle unknown skill
+			}
+		}
+
+		// Read and parse skill metadata
+		let metadata: SkillModelMetadata;
+		try {
+			const content = readFileSync(skill.filePath, "utf-8");
+			metadata = parseSkillMetadata(content);
+		} catch {
+			return { action: "continue" }; // Can't read skill, let pi handle it
+		}
+
+		// Check for model/thinking metadata
+		const modelMeta = metadata.model;
+		const thinkingLevel = metadata.thinkingLevel;
+
+		if (!modelMeta && !thinkingLevel) {
+			return { action: "continue" }; // No model preferences, proceed normally
+		}
+
+		// Save current state for restoration
+		const savedModel = ctx.model;
+		const savedThinking = pi.getThinkingLevel();
+		skillInProgress = true;
+
+		// Switch model if specified
+		if (modelMeta) {
+			const targetModel = ctx.modelRegistry.find(modelMeta.provider, modelMeta.id);
+
+			if (targetModel) {
+				const currentModel = ctx.model;
+				const alreadyActive = currentModel?.provider === targetModel.provider && currentModel?.id === targetModel.id;
+
+				if (!alreadyActive) {
+					const success = await pi.setModel(targetModel);
+					if (success) {
+						previousModel = savedModel;
+						ctx.ui.notify(`Skill "${skillName}" → ${modelMeta.provider}/${modelMeta.id}`, "info");
+					} else {
+						ctx.ui.notify(`No API key for ${modelMeta.provider}/${modelMeta.id}`, "warning");
+					}
+				}
+			} else {
+				ctx.ui.notify(`Model ${modelMeta.provider}/${modelMeta.id} not found`, "warning");
+			}
+		}
+
+		// Set thinking level if specified
+		if (thinkingLevel) {
+			// Compare against savedThinking (before model switch), not current
+			// Model switches can auto-adjust thinking level
+			if (thinkingLevel !== savedThinking && previousThinking === undefined) {
+				previousThinking = savedThinking;
+			}
+			pi.setThinkingLevel(thinkingLevel);
+			if (!modelMeta) {
+				ctx.ui.notify(`Skill "${skillName}" → thinking: ${thinkingLevel}`, "info");
+			}
+		}
+
+		return { action: "continue" };
 	});
 
 	// Inject skill into system prompt before agent starts
@@ -510,6 +723,9 @@ export default function promptModelExtension(pi: ExtensionAPI) {
 		if (restoredParts.length > 0) {
 			ctx.ui.notify(`Restored to ${restoredParts.join(", ")}`, "info");
 		}
+
+		// Reset skill routing state
+		skillInProgress = false;
 	});
 
 	// Initialize: register commands for prompts with model frontmatter
